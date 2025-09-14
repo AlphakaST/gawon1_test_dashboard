@@ -29,7 +29,7 @@ except Exception as e:
 st.info(f"DB 상태: {DB_STATUS}")
 
 # ──────────────────────────────────────────
-# 유틸: 스키마/테이블/컬럼 탐지
+# 유틸: 스키마/테이블/컬럼 탐지 (수정된 버전)
 # ──────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=60)
 def get_current_schema() -> str:
@@ -41,35 +41,33 @@ def get_current_schema() -> str:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def get_table_columns(schema: str, table: str) -> Set[str]:
-    """특정 테이블의 모든 컬럼 이름을 소문자로 반환합니다."""
+    """특정 테이블의 모든 컬럼 이름을 소문자로 반환합니다. (명명된 파라미터 사용으로 안정성 향상)"""
     if not conn: return set()
     try:
-        query = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s"
-        df_cols = conn.query(query, params=(schema, table), ttl=60)
+        # st.connection은 SQLAlchemy를 사용하므로 명명된 파라미터(:key)가 더 안정적입니다.
+        query = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=:schema AND TABLE_NAME=:table"
+        df_cols = conn.query(query, params={"schema": schema, "table": table}, ttl=60)
+        if df_cols.empty:
+            return set()
         return {str(r[0]).lower() for r in df_cols.itertuples(index=False, name=None)}
     except (exc.SQLAlchemyError, KeyError):
         return set()
 
 @st.cache_data(show_spinner=False, ttl=60)
 def list_problem_tables() -> List[Tuple[str, str]]:
-    """SHOW TABLES를 사용하여 DAT 테이블 목록을 안정적으로 조회합니다."""
+    """INFORMATION_SCHEMA를 사용하여 DAT 테이블 목록을 안정적으로 조회합니다."""
     if not conn:
         return [('pr', "DAT2")]
-
     try:
         schema_to_check = get_current_schema()
-        
-        query = f"SHOW TABLES FROM `{schema_to_check}`"
-        df_all_tables = conn.query(query, ttl=60)
+        # SHOW TABLES 대신 표준 INFORMATION_SCHEMA와 명명된 파라미터를 사용합니다.
+        query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = :schema AND TABLE_NAME LIKE 'DAT%'"
+        df_tables = conn.query(query, params={"schema": schema_to_check}, ttl=60)
 
-        if df_all_tables.empty:
-            return [('pr', "DAT2")]
-
-        all_table_names = df_all_tables.iloc[:, 0].tolist()
-        dat_table_names = [name for name in all_table_names if name.upper().startswith('DAT')]
-
-        if not dat_table_names:
+        if df_tables.empty:
             return [('pr', 'DAT2')]
+        
+        dat_table_names = df_tables.iloc[:, 0].tolist()
         
         valid_pairs = []
         for table in dat_table_names:
@@ -86,7 +84,6 @@ def list_problem_tables() -> List[Tuple[str, str]]:
             return (pri, p[0], t)
         valid_pairs.sort(key=keyfn)
         return valid_pairs
-
     except (exc.SQLAlchemyError, KeyError, IndexError):
         return [('pr', "DAT2")]
 
@@ -158,21 +155,17 @@ def parse_feedback_generic(text: str, qidx: int, table_name: str = "") -> Dict[s
         res["reason"] = "JSON 파싱 실패"; res["feedback"] = (text or "")[:500]
         return res
     
-    # 공통 필드 추출
     res["feedback"] = data.get("feedback", "")
     res["detected"] = data.get("detected", {})
     res["reason"] = data.get("reason", "")
     
-    # DAT1/2용 점수 필드 추출
     if "score" in data or "max" in data:
         res["score"] = data.get("score"); res["max"] = data.get("max")
         
-    # DAT3용 성취수준 필드 추출
     if "level" in data:
         lv = str(data.get("level") or "").upper()
         res["level"] = lv if lv in {"A","B","C","D"} else None
 
-    # DAT2 전용 키워드 라벨 변환 (예시)
     if table_name.upper() == "DAT2":
         flags = {}
         if qidx == 1: flags = {"응고/얼음": bool(res["detected"].get("freezing")), "열 방출(응고열)": bool(res["detected"].get("heat_release"))}
@@ -193,7 +186,6 @@ def to_dataframe(rows: List[Dict[str, Any]], nq: int, table_name: str) -> pd.Dat
         for i in range(1, nq + 1):
             pf = parse_feedback_generic(r.get(f"feedback{i}") or "", i, table_name)
             
-            # 점수 및 성취수준 컬럼 동시 생성
             row[f"점수{i}"] = pf["score"]
             row[f"만점{i}"] = pf["max"]
             row[f"성취{i}"] = pf["level"]
@@ -206,7 +198,6 @@ def to_dataframe(rows: List[Dict[str, Any]], nq: int, table_name: str) -> pd.Dat
                         total_max += int(pf["max"])
                 except (ValueError, TypeError): pass
 
-            # 상세 보기 및 다운로드용 원본 데이터 저장
             row[f"피드백{i}(요약)"] = (pf["feedback"] or "")[:120]
             row[f"_answer{i}"] = r.get(f"answer{i}", "")
             row[f"_feedback{i}"] = r.get(f"feedback{i}", "")
@@ -241,6 +232,10 @@ with st.sidebar:
         
     nq = detect_question_count(sel_schema, sel_table)
     st.caption(f"선택: **{sel_schema}.{sel_table}** · 자동 감지 문항 수: **{nq}**")
+    
+    # [개선] 문항 감지 실패 시 경고 메시지 표시
+    if nq == 0 and sel_table.upper() != "DAT1": # DAT1은 문항이 없을 수도 있음
+        st.warning(f"경고: {sel_table} 테이블에서 'answer1'/'feedback1' 컬럼을 찾지 못했습니다. 일부 데이터만 표시될 수 있습니다.")
 
     kw = st.text_input("학번/키워드 검색", placeholder="예: 10130 또는 '승화'")
     limit = st.number_input("표시 개수(최대 2000)", 10, 2000, 500, 10)
@@ -254,11 +249,8 @@ df = to_dataframe(rows, nq, sel_table)
 
 st.markdown(f"**총 {len(df)}건**의 결과가 있습니다. (최대 **{limit}**건까지 표시)")
 
-
-# [수정] 비어있지 않은 컬럼만 동적으로 표에 표시
 main_cols: List[str] = [c for c in ["제출시각", "학번", "총점", "총점_만점"] if c in df.columns]
 for i in range(1, nq + 1):
-    # 점수/만점/성취 컬럼 중 하나라도 값이 있으면 표에 추가
     for c in (f"점수{i}", f"만점{i}", f"성취{i}"):
         if c in df.columns and not df[c].isnull().all():
              main_cols.append(c)
@@ -280,7 +272,6 @@ if qid:
         else:
             row = sub.iloc[0]
             if nq > 0:
-                # [수정] nq=4(DAT3)일 경우 탭 이름 자동 변경
                 tab_names = [f"문항 {i}" for i in range(1, nq + 1)]
                 if nq == 4: tab_names = ["문항 1", "문항 2-1", "문항 2-2", "문항 3"]
                 
