@@ -52,14 +52,13 @@ def get_table_columns(schema: str, table: str) -> Set[str]:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def list_problem_tables() -> List[Tuple[str, str]]:
-    """SHOW TABLES를 사용하여 DAT 테이블 목록을 안정적으로 조회합니다. (수정된 버전)"""
+    """SHOW TABLES를 사용하여 DAT 테이블 목록을 안정적으로 조회합니다."""
     if not conn:
         return [('pr', "DAT2")]
 
     try:
         schema_to_check = get_current_schema()
         
-        # SQL의 LIKE 대신 Python에서 필터링하여 안정성 향상
         query = f"SHOW TABLES FROM `{schema_to_check}`"
         df_all_tables = conn.query(query, ttl=60)
 
@@ -151,21 +150,29 @@ def _json_parse(txt: str) -> Optional[Dict[str, Any]]:
     except Exception: return None
 
 def parse_feedback_generic(text: str, qidx: int, table_name: str = "") -> Dict[str, Any]:
+    """DAT1/2(점수형)와 DAT3(성취수준형) JSON을 모두 파싱하는 통합 함수."""
     res = {"score": None, "max": None, "level": None, "feedback": "", "detected": {}, "reason": ""}
     if not text: return res
     data = _json_parse(text)
     if not isinstance(data, dict):
         res["reason"] = "JSON 파싱 실패"; res["feedback"] = (text or "")[:500]
         return res
+    
+    # 공통 필드 추출
     res["feedback"] = data.get("feedback", "")
     res["detected"] = data.get("detected", {})
+    res["reason"] = data.get("reason", "")
+    
+    # DAT1/2용 점수 필드 추출
     if "score" in data or "max" in data:
         res["score"] = data.get("score"); res["max"] = data.get("max")
+        
+    # DAT3용 성취수준 필드 추출
     if "level" in data:
         lv = str(data.get("level") or "").upper()
         res["level"] = lv if lv in {"A","B","C","D"} else None
-    if "reason" in data and isinstance(data.get("reason"), str):
-        res["reason"] = data.get("reason")
+
+    # DAT2 전용 키워드 라벨 변환 (예시)
     if table_name.upper() == "DAT2":
         flags = {}
         if qidx == 1: flags = {"응고/얼음": bool(res["detected"].get("freezing")), "열 방출(응고열)": bool(res["detected"].get("heat_release"))}
@@ -185,28 +192,35 @@ def to_dataframe(rows: List[Dict[str, Any]], nq: int, table_name: str) -> pd.Dat
         total, total_max, has_any_score = 0, 0, False
         for i in range(1, nq + 1):
             pf = parse_feedback_generic(r.get(f"feedback{i}") or "", i, table_name)
-            row[f"점수{i}"] = pf["score"]; row[f"만점{i}"] = pf["max"]
+            
+            # 점수 및 성취수준 컬럼 동시 생성
+            row[f"점수{i}"] = pf["score"]
+            row[f"만점{i}"] = pf["max"]
+            row[f"성취{i}"] = pf["level"]
+            
             if pf["score"] is not None:
                 has_any_score = True
                 try:
                     total += int(pf["score"])
-                    total_max += int(pf["max"]) if pf["max"] is not None else 0
+                    if pf["max"] is not None:
+                        total_max += int(pf["max"])
                 except (ValueError, TypeError): pass
-            row[f"성취{i}"] = pf["level"]
+
+            # 상세 보기 및 다운로드용 원본 데이터 저장
             row[f"피드백{i}(요약)"] = (pf["feedback"] or "")[:120]
             row[f"_answer{i}"] = r.get(f"answer{i}", "")
             row[f"_feedback{i}"] = r.get(f"feedback{i}", "")
             row[f"_reason{i}"] = pf.get("reason", "")
             row[f"_flags{i}"] = pf.get("detected", {})
+            
         row["총점"] = total if has_any_score else None
         row["총점_만점"] = total_max if (has_any_score and total_max) else None
         records.append(row)
 
     df = pd.DataFrame.from_records(records)
-    if not df.empty and "제출시각" in df.columns:
-        df.sort_values(by="제출시각", ascending=False, inplace=True, ignore_index=True)
-    elif not df.empty and "학번" in df.columns:
-        df.sort_values(by="학번", ascending=False, inplace=True, ignore_index=True)
+    if not df.empty:
+        sort_col = "제출시각" if "제출시각" in df.columns else "학번"
+        df.sort_values(by=sort_col, ascending=False, inplace=True, ignore_index=True)
     return df
 
 # ──────────────────────────────────────────
@@ -238,12 +252,13 @@ with st.sidebar:
 rows = fetch_rows(schema=sel_schema, table=sel_table, nq=nq, keyword=kw.strip(), limit=int(limit))
 df = to_dataframe(rows, nq, sel_table)
 
-# [수정] 데이터 건수 표시 부분에 (최대 표시 건수) 안내 추가
 st.markdown(f"**총 {len(df)}건**의 결과가 있습니다. (최대 **{limit}**건까지 표시)")
 
 
+# [수정] 비어있지 않은 컬럼만 동적으로 표에 표시
 main_cols: List[str] = [c for c in ["제출시각", "학번", "총점", "총점_만점"] if c in df.columns]
 for i in range(1, nq + 1):
+    # 점수/만점/성취 컬럼 중 하나라도 값이 있으면 표에 추가
     for c in (f"점수{i}", f"만점{i}", f"성취{i}"):
         if c in df.columns and not df[c].isnull().all():
              main_cols.append(c)
@@ -265,8 +280,10 @@ if qid:
         else:
             row = sub.iloc[0]
             if nq > 0:
+                # [수정] nq=4(DAT3)일 경우 탭 이름 자동 변경
                 tab_names = [f"문항 {i}" for i in range(1, nq + 1)]
                 if nq == 4: tab_names = ["문항 1", "문항 2-1", "문항 2-2", "문항 3"]
+                
                 tabs = st.tabs(tab_names)
                 for i, tb in enumerate(tabs, start=1):
                     with tb:
