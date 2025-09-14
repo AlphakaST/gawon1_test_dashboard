@@ -23,9 +23,3 @@
 ## 🚀 실행 가이드
 
 이 프로젝트를 로컬 환경에서 실행하거나 Streamlit Share에 배포할 수 있습니다.
-
-### 1️⃣ 라이브러리 설치
-필요한 라이브러리를 설치합니다.
-
-```bash
-pip install -r requirements.txt
