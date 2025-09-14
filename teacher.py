@@ -18,7 +18,7 @@ st.caption("학생 제출 내역을 검색/열람하고 CSV로 내려받을 수 
 # ──────────────────────────────────────────
 try:
     # st.connection은 .streamlit/secrets.toml 또는 Streamlit Share의 Secrets 설정을 자동으로 읽습니다.
-    # user -> username 으로 변경된 secrets 설정을 사용해야 합니다.
+    # secrets에 user 대신 username 으로 키를 설정해야 합니다.
     conn = st.connection("mysql", type="sql")
     conn.query("SELECT 1")
     DB_STATUS = "ONLINE"
@@ -52,23 +52,28 @@ def get_table_columns(schema: str, table: str) -> Set[str]:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def list_problem_tables() -> List[Tuple[str, str]]:
-    """SHOW TABLES를 사용하여 DAT 테이블 목록을 안정적으로 조회합니다."""
+    """SHOW TABLES를 사용하여 DAT 테이블 목록을 안정적으로 조회합니다. (수정된 버전)"""
     if not conn:
         return [('pr', "DAT2")]
 
     try:
         schema_to_check = get_current_schema()
         
-        query = f"SHOW TABLES FROM `{schema_to_check}` LIKE 'DAT%'"
-        df_tables = conn.query(query, ttl=60)
+        # SQL의 LIKE 대신 Python에서 필터링하여 안정성 향상
+        query = f"SHOW TABLES FROM `{schema_to_check}`"
+        df_all_tables = conn.query(query, ttl=60)
 
-        if df_tables.empty:
+        if df_all_tables.empty:
             return [('pr', "DAT2")]
 
-        table_names = df_tables.iloc[:, 0].tolist()
+        all_table_names = df_all_tables.iloc[:, 0].tolist()
+        dat_table_names = [name for name in all_table_names if name.upper().startswith('DAT')]
+
+        if not dat_table_names:
+            return [('pr', 'DAT2')]
         
         valid_pairs = []
-        for table in table_names:
+        for table in dat_table_names:
             cols = get_table_columns(schema_to_check, table)
             if 'id' in cols:
                 valid_pairs.append((schema_to_check, table))
@@ -200,6 +205,8 @@ def to_dataframe(rows: List[Dict[str, Any]], nq: int, table_name: str) -> pd.Dat
     df = pd.DataFrame.from_records(records)
     if not df.empty and "제출시각" in df.columns:
         df.sort_values(by="제출시각", ascending=False, inplace=True, ignore_index=True)
+    elif not df.empty and "학번" in df.columns:
+        df.sort_values(by="학번", ascending=False, inplace=True, ignore_index=True)
     return df
 
 # ──────────────────────────────────────────
@@ -215,7 +222,9 @@ with st.sidebar:
                 if t.upper() == pref: return i
         return 0
     idx = st.selectbox("데이터 소스(스키마.테이블)", range(len(labels)), format_func=lambda i: labels[i], index=min(default_index(), len(labels)-1))
-    sel_schema, sel_table = tables[idx]
+    
+    sel_schema, sel_table = tables[idx] if tables else ("pr", "DAT2")
+        
     nq = detect_question_count(sel_schema, sel_table)
     st.caption(f"선택: **{sel_schema}.{sel_table}** · 자동 감지 문항 수: **{nq}**")
 
@@ -229,13 +238,17 @@ with st.sidebar:
 rows = fetch_rows(schema=sel_schema, table=sel_table, nq=nq, keyword=kw.strip(), limit=int(limit))
 df = to_dataframe(rows, nq, sel_table)
 
-st.markdown(f"**총 {len(df)}건** 결과가 있습니다.")
+# [수정] 데이터 건수 표시 부분에 (최대 표시 건수) 안내 추가
+st.markdown(f"**총 {len(df)}건**의 결과가 있습니다. (최대 **{limit}**건까지 표시)")
+
 
 main_cols: List[str] = [c for c in ["제출시각", "학번", "총점", "총점_만점"] if c in df.columns]
 for i in range(1, nq + 1):
     for c in (f"점수{i}", f"만점{i}", f"성취{i}"):
-        if c in df.columns: main_cols.append(c)
-if "의견(요약)" in df.columns: main_cols.append("의견(요약)")
+        if c in df.columns and not df[c].isnull().all():
+             main_cols.append(c)
+if "의견(요약)" in df.columns and df["의견(요약)"].str.strip().any():
+    main_cols.append("의견(요약)")
 
 st.dataframe(df[main_cols] if not df.empty else pd.DataFrame(columns=main_cols), use_container_width=True, height=480)
 
@@ -243,7 +256,6 @@ st.divider()
 st.subheader("🧾 상세 보기(학번 입력)")
 qid = st.text_input("학번 입력", placeholder="예: 10130", key="detail_id")
 if qid:
-    # KeyError: '학번' 방지를 위해 df가 비어있는지 먼저 확인
     if df.empty or "학번" not in df.columns:
         st.info("조회된 데이터가 없어 학번을 검색할 수 없습니다.")
     else:
@@ -264,7 +276,8 @@ if qid:
                                 st.markdown("**채점 근거**"); st.write(reason)
                             st.markdown("**피드백(전문)**")
                             try:
-                                raw = json.loads(row.get(f"_feedback{i}", ""))
+                                raw_fb = row.get(f"_feedback{i}", "{}")
+                                raw = json.loads(raw_fb if raw_fb and raw_fb.strip() else "{}")
                                 st.write(raw.get("feedback", ""))
                                 if lv := raw.get("level"): st.caption(f"성취수준: {lv}")
                             except Exception:
@@ -280,7 +293,7 @@ if qid:
             else:
                 st.info("이 테이블에는 상세 분석할 문항(답안/피드백)이 없습니다.")
 
-            if "의견(요약)" in row and row["의견(요약)"]:
+            if "의견(요약)" in row and pd.notna(row["의견(요약)"]) and row["의견(요약)"].strip():
                 st.markdown("**학생 의견(전문)**"); st.write(row.get("의견(요약)"))
 
 st.divider()
