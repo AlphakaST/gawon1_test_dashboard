@@ -83,29 +83,42 @@ def get_table_columns(schema: str, table: str) -> Set[str]:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def list_problem_tables() -> List[Tuple[str, str]]:
-    if not conn: return [(get_current_schema(), "DAT2")] # 기본값
+    """조회 대상 테이블 목록 반환 [(schema, table)]. 안정성을 개선한 버전."""
+    if not conn:
+        return [('pr', "DAT2")]  # DB 연결 실패 시 기본값 'pr' 사용
+
     try:
-        current = get_current_schema()
-        schemas_to_check = [s for s in {current, "pr"} if s and schema_exists(s)]
-        if not schemas_to_check: return [(current, "DAT2")]
+        # secrets에 명시된 기본 DB와 'pr' 스키마를 대상으로 조회
+        default_db = st.secrets.get("connections", {}).get("mysql", {}).get("database", "pr")
+        schemas_to_check = list(dict.fromkeys([default_db, 'pr'])) # 중복 제거 및 순서 유지
 
-        # SQLAlchemy는 IN 절에 리스트를 직접 바인딩할 수 있습니다.
-        sql = """
-            SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA IN :schemas AND COLUMN_NAME IN ('id','answer1','feedback1')
-            GROUP BY TABLE_SCHEMA, TABLE_NAME HAVING COUNT(DISTINCT COLUMN_NAME)=3
-        """
-        df = conn.query(sql, params={"schemas": schemas_to_check})
-        pairs = list(zip(df['TABLE_SCHEMA'], df['TABLE_NAME']))
+        query = """
+            SELECT TABLE_SCHEMA, TABLE_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA IN ({placeholders})
+              AND COLUMN_NAME IN ('id', 'answer1', 'feedback1')
+            GROUP BY TABLE_SCHEMA, TABLE_NAME
+            HAVING COUNT(DISTINCT COLUMN_NAME) = 3
+        """.format(placeholders=",".join(["%s"] * len(schemas_to_check)))
 
-        def keyfn(p: Tuple[str,str]):
+        df_tables = conn.query(query, params=tuple(schemas_to_check), ttl=60)
+
+        if df_tables.empty:
+            # 자동 감지 실패 시, 에러 방지를 위해 기본 스키마 'pr'을 명시적으로 반환
+            return [('pr', "DAT2")]
+
+        pairs = [(row['TABLE_SCHEMA'], row['TABLE_NAME']) for _, row in df_tables.iterrows()]
+
+        def keyfn(p: Tuple[str, str]):
             _, t = p
-            pri = 0 if t.upper()=="DAT3" else 1 if t.upper()=="DAT2" else 2 if t.upper()=="DAT1" else 3
+            pri = 0 if t.upper() == "DAT3" else 1 if t.upper() == "DAT2" else 2 if t.upper() == "DAT1" else 3
             return (pri, p[0], t)
         pairs.sort(key=keyfn)
-        return pairs or [(current, "DAT2")]
+        return pairs
+
     except (exc.SQLAlchemyError, KeyError):
-        return [(get_current_schema(), "DAT2")]
+        # 쿼리 중 예외 발생 시에도 기본 스키마 'pr'을 명시적으로 반환
+        return [('pr', "DAT2")]
 
 @st.cache_data(show_spinner=False, ttl=60)
 def detect_question_count(schema: str, table: str, max_q: int = 4) -> int:
@@ -366,4 +379,5 @@ else:
     st.info("다운로드할 데이터가 없습니다.")
 
 st.caption("Tip) 좌측에서 스키마.테이블을 바꾸면 DAT1/2/3 데이터를 한 화면에서 조회할 수 있습니다.")
+
 
