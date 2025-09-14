@@ -17,6 +17,8 @@ st.caption("학생 제출 내역을 검색/열람하고 CSV로 내려받을 수 
 # DB 연결
 # ──────────────────────────────────────────
 try:
+    # st.connection은 .streamlit/secrets.toml 또는 Streamlit Share의 Secrets 설정을 자동으로 읽습니다.
+    # user -> username 으로 변경된 secrets 설정을 사용해야 합니다.
     conn = st.connection("mysql", type="sql")
     conn.query("SELECT 1")
     DB_STATUS = "ONLINE"
@@ -33,7 +35,7 @@ st.info(f"DB 상태: {DB_STATUS}")
 def get_current_schema() -> str:
     """st.secrets에 명시된 기본 데이터베이스 이름을 반환합니다."""
     try:
-        return st.secrets.get("connections", {}).get("mysql", {}).get("database", "pr")
+        return st.secrets.connections.mysql.database
     except Exception:
         return "pr"
 
@@ -50,39 +52,30 @@ def get_table_columns(schema: str, table: str) -> Set[str]:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def list_problem_tables() -> List[Tuple[str, str]]:
-    """조회 대상 테이블 목록 반환 [(schema, table)]. 안정성을 개선한 버전."""
+    """SHOW TABLES를 사용하여 DAT 테이블 목록을 안정적으로 조회합니다."""
     if not conn:
         return [('pr', "DAT2")]
 
     try:
-        default_db = get_current_schema()
-        schemas_to_check = list(dict.fromkeys([default_db, 'pr']))
-
-        # 1. 'DAT%' 패턴을 가진 테이블 목록을 먼저 찾습니다.
-        query = """
-            SELECT TABLE_SCHEMA, TABLE_NAME
-            FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA IN ({placeholders})
-              AND TABLE_NAME LIKE 'DAT%'
-        """.format(placeholders=",".join(["%s"] * len(schemas_to_check)))
-
-        df_tables = conn.query(query, params=tuple(schemas_to_check), ttl=60)
+        schema_to_check = get_current_schema()
+        
+        query = f"SHOW TABLES FROM `{schema_to_check}` LIKE 'DAT%'"
+        df_tables = conn.query(query, ttl=60)
 
         if df_tables.empty:
             return [('pr', "DAT2")]
 
-        # 2. 찾은 테이블들이 최소 조건('id' 컬럼)을 만족하는지 확인합니다.
+        table_names = df_tables.iloc[:, 0].tolist()
+        
         valid_pairs = []
-        for _, row in df_tables.iterrows():
-            schema, table = row['TABLE_SCHEMA'], row['TABLE_NAME']
-            cols = get_table_columns(schema, table)
+        for table in table_names:
+            cols = get_table_columns(schema_to_check, table)
             if 'id' in cols:
-                valid_pairs.append((schema, table))
-
+                valid_pairs.append((schema_to_check, table))
+        
         if not valid_pairs:
              return [('pr', "DAT2")]
 
-        # 3. 우선순위에 따라 정렬합니다.
         def keyfn(p: Tuple[str, str]):
             _, t = p
             pri = 0 if t.upper() == "DAT3" else 1 if t.upper() == "DAT2" else 2 if t.upper() == "DAT1" else 3
@@ -90,8 +83,9 @@ def list_problem_tables() -> List[Tuple[str, str]]:
         valid_pairs.sort(key=keyfn)
         return valid_pairs
 
-    except (exc.SQLAlchemyError, KeyError):
+    except (exc.SQLAlchemyError, KeyError, IndexError):
         return [('pr', "DAT2")]
+
 
 @st.cache_data(show_spinner=False, ttl=60)
 def detect_question_count(schema: str, table: str, max_q: int = 4) -> int:
@@ -102,7 +96,6 @@ def detect_question_count(schema: str, table: str, max_q: int = 4) -> int:
         if f"answer{n}" in cols and f"feedback{n}" in cols:
             count = n
         else:
-            # 연속되지 않으면 중단합니다. (예: answer1, feedback1, answer3, feedback3는 1로 처리)
             break
     return count
 
@@ -250,41 +243,45 @@ st.divider()
 st.subheader("🧾 상세 보기(학번 입력)")
 qid = st.text_input("학번 입력", placeholder="예: 10130", key="detail_id")
 if qid:
-    sub = df[df["학번"].astype(str) == qid.strip()]
-    if sub.empty:
-        st.info("해당 학번의 제출 내역이 없습니다.")
+    # KeyError: '학번' 방지를 위해 df가 비어있는지 먼저 확인
+    if df.empty or "학번" not in df.columns:
+        st.info("조회된 데이터가 없어 학번을 검색할 수 없습니다.")
     else:
-        row = sub.iloc[0]
-        if nq > 0:
-            tab_names = [f"문항 {i}" for i in range(1, nq + 1)]
-            if nq == 4: tab_names = ["문항 1", "문항 2-1", "문항 2-2", "문항 3"]
-            tabs = st.tabs(tab_names)
-            for i, tb in enumerate(tabs, start=1):
-                with tb:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if reason := row.get(f"_reason{i}", ""):
-                            st.markdown("**채점 근거**"); st.write(reason)
-                        st.markdown("**피드백(전문)**")
-                        try:
-                            raw = json.loads(row.get(f"_feedback{i}", ""))
-                            st.write(raw.get("feedback", ""))
-                            if lv := raw.get("level"): st.caption(f"성취수준: {lv}")
-                        except Exception:
-                            st.write(row.get(f"피드백{i}(요약)", ""))
-                    with c2:
-                        st.markdown("**학생 답안(전문)**"); st.write(row.get(f"_answer{i}", ""))
-                        st.markdown("**조건 충족(탐지)**")
-                        if flags := row.get(f"_flags{i}"):
-                            for k, v in flags.items():
-                                st.write(f"{k}: {'✅' if isinstance(v, bool) and v else '❌' if isinstance(v, bool) else v}")
-                        else:
-                            st.write("-")
+        sub = df[df["학번"].astype(str) == qid.strip()]
+        if sub.empty:
+            st.info("해당 학번의 제출 내역이 없습니다.")
         else:
-            st.info("이 테이블에는 상세 분석할 문항(답안/피드백)이 없습니다.")
+            row = sub.iloc[0]
+            if nq > 0:
+                tab_names = [f"문항 {i}" for i in range(1, nq + 1)]
+                if nq == 4: tab_names = ["문항 1", "문항 2-1", "문항 2-2", "문항 3"]
+                tabs = st.tabs(tab_names)
+                for i, tb in enumerate(tabs, start=1):
+                    with tb:
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if reason := row.get(f"_reason{i}", ""):
+                                st.markdown("**채점 근거**"); st.write(reason)
+                            st.markdown("**피드백(전문)**")
+                            try:
+                                raw = json.loads(row.get(f"_feedback{i}", ""))
+                                st.write(raw.get("feedback", ""))
+                                if lv := raw.get("level"): st.caption(f"성취수준: {lv}")
+                            except Exception:
+                                st.write(row.get(f"피드백{i}(요약)", ""))
+                        with c2:
+                            st.markdown("**학생 답안(전문)**"); st.write(row.get(f"_answer{i}", ""))
+                            st.markdown("**조건 충족(탐지)**")
+                            if flags := row.get(f"_flags{i}"):
+                                for k, v in flags.items():
+                                    st.write(f"{k}: {'✅' if isinstance(v, bool) and v else '❌' if isinstance(v, bool) else v}")
+                            else:
+                                st.write("-")
+            else:
+                st.info("이 테이블에는 상세 분석할 문항(답안/피드백)이 없습니다.")
 
-        if "의견(요약)" in row and row["의견(요약)"]:
-            st.markdown("**학생 의견(전문)**"); st.write(row.get("의견(요약)"))
+            if "의견(요약)" in row and row["의견(요약)"]:
+                st.markdown("**학생 의견(전문)**"); st.write(row.get("의견(요약)"))
 
 st.divider()
 st.subheader("⬇️ CSV 다운로드")
